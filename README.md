@@ -29,9 +29,14 @@ A UDP client-server application demonstrating high-performance, error-resilient 
 │                                                      │
 │  ┌──────────────────────────────────────────────┐    │
 │  │  ImGui UI (Map + Telemetry + Controls)       │    │
-│  │  - Click map to send waypoints               │    │
+│  │  - Click map to send target coordinates      │    │
 │  │  - Heartbeat monitor (3s timeout)            │    │
 │  │  - Packet drop slider                        │    │
+│  └──────────────────┬───────────────────────────┘    │
+│                     │                                │
+│  ┌──────────────────▼───────────────────────────┐    │
+│  │  ReliableSender (Retry-until-ACK)            │    │
+│  │  - Retries every 100ms until ACK or 2s       │    │
 │  └──────────────────┬───────────────────────────┘    │
 │                     │                                │
 │  ┌──────────────────▼───────────────────────────┐    │
@@ -50,11 +55,11 @@ A UDP client-server application demonstrating high-performance, error-resilient 
 │  ┌────────────┐  ┌─────────────┐  ┌───────────────┐  │
 │  │ Main Thread│  │ Beacon (10Hz│  │ Communicator  │  │
 │  │ (Simulation│  │  Heartbeat) │  │ (Send + Recv  │  │
-│  │ + Commands)│  │             │  │   threads)    │  │
+│  │ + Movement)│  │             │  │   threads)    │  │
 │  └────────────┘  └─────────────┘  └───────────────┘  │
 │                                                      │
 │  ┌──────────────────────────────────────────────┐    │
-│  │  Drone State: X, Y, Alt, Speed, Heading      │    │
+│  │  Drone State: Lat, Lon, Alt, Speed, Heading  │    │
 │  │  Mode: GUIDED_DISARMED / GUIDED_ARMED /      │    │
 │  │        AUTO_ARMED                            │    │
 │  └──────────────────────────────────────────────┘    │
@@ -67,11 +72,13 @@ A UDP client-server application demonstrating high-performance, error-resilient 
 
 The drone is a UDP client that simulates a quadrotor with minimal state:
 
-- **3D State**: Local X, Y, Altitude, Speed (m/s), and Heading (degrees)
-- **Modes**: `MAV_MODE_GUIDED_DISARMED` (80), `MAV_MODE_GUIDED_ARMED` (88), `MAV_MODE_AUTO_ARMED` (92). Starts as `GUIDED_ARMED`.
-- **Telemetry stream at 10 Hz**: Sends `HEARTBEAT`, `LOCAL_POSITION_NED`, and `GLOBAL_POSITION_INT` messages
+- **Position**: Latitude, Longitude (geographic coordinates), Altitude, Speed (m/s), and Heading (degrees)
+- **Initialization**: Starts at the center of the map (59.4241°N, 24.8132°E) and broadcasts its initial position on boot
+- **Movement**: Moves toward a target at 15 m/s using Euclidean distance, updating position every 100ms
+- **Modes**: `MAV_MODE_GUIDED_ARMED` (idle/hold), `MAV_MODE_AUTO_ARMED` (moving to target). Starts as `GUIDED_ARMED`, switches to `AUTO_ARMED` when following a target, and back to `GUIDED_ARMED` on arrival or HOLD command.
+- **Telemetry stream at 10 Hz**: Sends `HEARTBEAT` (mode) and `GLOBAL_POSITION_INT` (lat, lon, altitude, speed, heading)
 - **Accepts commands**:
-  - `SET_POSITION_TARGET_GLOBAL_INT` — move to a waypoint (ACKed with `POSITION_TARGET_GLOBAL_INT`)
+  - `SET_POSITION_TARGET_GLOBAL_INT` — move to target coordinates (ACKed with `POSITION_TARGET_GLOBAL_INT`)
   - `MAV_CMD_OVERRIDE_GOTO` (DO_HOLD) — hold position (ACKed with `COMMAND_ACK`)
 - MAVLink communication runs on separate threads and does not block the main simulation thread
 
@@ -79,10 +86,10 @@ The drone is a UDP client that simulates a quadrotor with minimal state:
 
 The GCS is a UDP server with an ImGui-based debug GUI:
 
-- **Connection status**: Connected/Disconnected indicator with connection quality percentage
-- **Telemetry display**: X, Y, Altitude, Speed, Heading, MAV_MODE
-- **Drone control**: Send `SET_POSITION_TARGET_GLOBAL_INT` and `MAV_CMD_OVERRIDE_GOTO` commands. All commands are ACKed.
-- **2D Map visualization**: Top-down drone position display over a map of Ülemiste (click to set waypoints)
+- **Connection status**: Connected/Disconnected indicator (green/red) with connection quality indicator
+- **Telemetry display**: Latitude, Longitude, Altitude, Speed, Heading, MAV_MODE, Packet Loss %
+- **Drone control**: Click on the map to send target coordinates, or press Hold to stop the drone. All commands use a retry-until-ACK mechanism (`ReliableSender`) that retries every 100ms until ACKed or 2-second timeout.
+- **2D Map visualization**: Top-down drone position (red circle) displayed over a satellite map of Ülemiste. Click anywhere on the map to send the drone to that location (lat/lon calculated from map bounds).
 - **Proxy controls**: Packet drop percentage slider in the UI
 - MAVLink communication runs on separate threads and does not block the main GUI thread
 
@@ -153,12 +160,18 @@ The GCS window will display the map, telemetry data, and controls. Click on the 
 
 ## Testing
 
-Unit tests are built with Google Test and Google Mock. They cover server and client communication patterns, including a stress test under 75% packet loss.
+Unit tests are built with Google Test and Google Mock. They cover MAVLink encode/decode patterns, reliable command delivery, and stress tests under 75% packet loss — all without binding UDP ports (using simulated lossy channels).
 
 ```bash
-cd build/test
-./UnitTests
+cd build
+./test/UnitTests
 ```
+
+**Test suites:**
+- `CommunicatorTest` — mock communicator interface tests
+- `MavlinkPatterns` — encode/decode verification for all message types (Heartbeat, GlobalPositionInt, SetPositionTarget, CommandLong, CommandAck, PositionTargetGlobalInt)
+- `ReliableDelivery` — baseline retry-until-ACK tests at 0% loss
+- `StressTest75` — 75% packet loss stress tests: position target ACK, hold command ACK, 15 sequential commands, and drop rate statistics validation
 
 A standalone heartbeat/parameter test is also available:
 
@@ -176,9 +189,9 @@ KrattAssignment/
 ├── README.md
 ├── Drone/
 │   ├── CMakeLists.txt          # Drone build config
-│   ├── main.cpp                # Entry point, signal handling, command dispatch
+│   ├── main.cpp                # Entry point, movement simulation, command handling
 │   ├── drone.h / drone.cpp     # Drone state container (position + mode)
-│   ├── drone_state.h / .cpp    # Position/velocity state management
+│   ├── drone_state.h / .cpp    # Lat/Lon/Alt/Speed/Heading state management
 │   ├── drone_status.h          # MAV_MODE enum definitions
 │   ├── communicator.h / .cpp   # UDP communication (send/recv threads, MAVLink)
 │   ├── beacon.h / beacon.cpp   # 10 Hz heartbeat broadcaster
@@ -186,13 +199,14 @@ KrattAssignment/
 │   └── test_heartbeat.cpp      # Standalone heartbeat + parameter test
 ├── GroundControl/
 │   ├── CMakeLists.txt          # GCS build config
-│   ├── main.cpp                # ImGui UI, telemetry display, waypoint control
+│   ├── main.cpp                # ImGui UI, telemetry display, map click control
 │   ├── proxy.h / proxy.cpp     # UDP proxy with packet drop/rate limiting
+│   ├── reliable_sender.h       # Retry-until-ACK mechanism for commands
 │   └── images/
 │       └── ülemiste.jpg        # Map overlay for 2D drone visualization
 ├── test/
 │   ├── CMakeLists.txt          # Unit test build config
-│   └── main.cpp                # Google Test/Mock tests for communication
+│   └── main.cpp                # Mock, encode/decode, reliable delivery, 75% stress tests
 └── libs/                       # Third-party libraries (included as source)
     ├── c_library_v2/           # MAVLink C headers
     ├── glfw/                   # GLFW windowing library
@@ -210,13 +224,13 @@ All communication uses **MAVLink v2** over UDP.
 | Message                          | ID | Direction     | Purpose                              |
 |----------------------------------|----|---------------|--------------------------------------|
 | `HEARTBEAT`                      | 0  | Drone → GCS   | 10 Hz alive signal, mode reporting   |
-| `LOCAL_POSITION_NED`             | 32 | Drone → GCS   | X, Y position                        |
-| `GLOBAL_POSITION_INT`            | 33 | Drone → GCS   | Altitude, speed, heading             |
-| `SET_POSITION_TARGET_GLOBAL_INT` | 86 | GCS → Drone   | Waypoint command                     |
+| `GLOBAL_POSITION_INT`            | 33 | Drone → GCS   | Lat, Lon, Altitude, Speed, Heading   |
+| `SET_POSITION_TARGET_GLOBAL_INT` | 86 | GCS → Drone   | Target coordinates command           |
+| `POSITION_TARGET_GLOBAL_INT`     | 87 | Drone → GCS   | ACK for position target command      |
 | `COMMAND_LONG`                   | 76 | GCS → Drone   | `MAV_CMD_OVERRIDE_GOTO` (hold)       |
-| `COMMAND_ACK`                    | 77 | Drone → GCS   | Command acknowledgement              |
+| `COMMAND_ACK`                    | 77 | Drone → GCS   | ACK for hold command                 |
 
-Commands use a retry-and-ACK mechanism to guarantee delivery even under high packet loss (up to 2 second delay allowed).
+Commands use a retry-until-ACK mechanism (`ReliableSender`) that resends every 100ms until the matching ACK is received, with a 2-second timeout. This guarantees delivery even under 75%+ packet loss.
 
 ### UDP Ports
 
@@ -231,10 +245,10 @@ Discovery is automatic — the drone sends a discovery request and the proxy res
 
 The application uses **C++20 `std::jthread`** with stop tokens for graceful shutdown across all components.
 
-| Component | Threads | Description                                               |
-|-----------|---------|-----------------------------------------------------------|
+| Component | Threads | Description                                                                             |
+|-----------|---------|-----------------------------------------------------------------------------------------|
 | **Drone** | 3+      | Main (simulation + command handling), Communicator (send + receive), Beacon (heartbeat) |
-| **GCS**   | 3+      | Main (ImGui render loop), Proxy recv thread, Proxy delivery thread |
+| **GCS**   | 3+      | Main (ImGui render loop), Proxy recv thread, Proxy delivery thread                      |
 
 Key concurrency patterns:
 - **Thread-safe queue** (`ThreadSafeQueue<T>`): `std::mutex` + `std::condition_variable_any` with C++20 `std::stop_token` integration for clean shutdown
@@ -252,5 +266,5 @@ All libraries are included as source in the `libs/` directory:
 | [SimpleUDP](https://github.com/RedFox20/SimpleUDP)                   | UDP networking                 |
 | [Dear ImGui](https://github.com/ocornut/imgui)                       | GCS debug GUI                  |
 | [GLFW](https://github.com/glfw/glfw)                                 | Window/OpenGL context for GUI  |
-| [Google Test](https://github.com/google/googletest)                   | Unit testing framework         |
+| [Google Test](https://github.com/google/googletest)                  | Unit testing framework         |
 | [stb_image](https://github.com/nothings/stb)                         | Image loading for map texture  |
